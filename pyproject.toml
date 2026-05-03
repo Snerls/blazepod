@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blazepod"
+version = "0.1.0"
+description = "Subscription-free controller for BlazePod reaction pods over BLE"
+requires-python = ">=3.11"
+dependencies = [
+    "bleak>=0.22",
+    "PyQt6>=6.6",
+    "qasync>=0.27",
+    "textual>=0.80",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+blazepod = "blazepod.ui.qt:main"
+blazepod-tui = "blazepod.ui.tui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BlazePod controller</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f1115">
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- Pods screen -->
+  <section id="screen-pods" class="screen active">
+    <h1>Pods</h1>
+    <p class="muted" id="pods-status">No pods yet. Tap "+ Add pod" and pick one from the list.</p>
+    <div class="pod-list" id="pods-list"></div>
+    <button id="btn-add-pod" class="big">+ Add pod</button>
+    <div class="row">
+      <button id="btn-identify" class="secondary" disabled>Identify (flash all)</button>
+      <button id="btn-disconnect" class="secondary" disabled>Disconnect all</button>
+    </div>
+    <div class="spacer"></div>
+    <button id="btn-go-menu" class="big full" disabled>Continue →</button>
+  </section>
+
+  <!-- Menu screen -->
+  <section id="screen-menu" class="screen">
+    <h1>Choose a drill</h1>
+    <p class="muted" id="menu-connected"></p>
+    <button class="big full" data-preset="random">Random Light</button>
+    <button class="big full" data-preset="sequence">Sequence</button>
+    <button class="big full" data-preset="color_match">Color Match</button>
+    <button class="big full secondary" id="btn-custom">Custom drill…</button>
+    <div class="spacer"></div>
+    <div class="footer-row">
+      <button class="secondary" id="btn-back-pods">← Back to pods</button>
+    </div>
+  </section>
+
+  <!-- Custom config -->
+  <section id="screen-config" class="screen">
+    <h1>Custom Drill</h1>
+
+    <h2>Setup</h2>
+    <div class="field"><label>Stations:</label>
+      <input type="number" id="cfg-stations" min="1" max="16" value="1"></div>
+    <div class="field"><label>Pods per station:</label>
+      <input type="number" id="cfg-pps" min="1" max="16" value="6">
+      <span class="help" id="cfg-pods-help"></span></div>
+    <div class="field"><label>Players:</label>
+      <input type="number" id="cfg-players" min="1" max="8" value="1"></div>
+    <div class="players-list" id="cfg-players-list"></div>
+
+    <h2>Behavior</h2>
+    <div class="field"><label>Lights out:</label>
+      <div class="radios" id="cfg-lights-out">
+        <label><input type="radio" name="lo" value="hit" checked> Hit</label>
+        <label><input type="radio" name="lo" value="timeout"> Timeout</label>
+        <label><input type="radio" name="lo" value="hit_and_timeout"> Hit &amp; timeout</label>
+      </div></div>
+    <div class="field"><label>Timeout (s):</label>
+      <input type="number" id="cfg-timeout" min="0.1" max="60" step="0.5" value="3.0"></div>
+
+    <div class="field"><label>Light delay:</label>
+      <div class="radios" id="cfg-light-delay">
+        <label><input type="radio" name="ld" value="none" checked> None</label>
+        <label><input type="radio" name="ld" value="fixed"> Fixed</label>
+        <label><input type="radio" name="ld" value="random"> Random</label>
+      </div></div>
+    <div class="field"><label>Fixed delay (s):</label>
+      <input type="number" id="cfg-delay-fixed" min="0" max="10" step="0.1" value="1.0"></div>
+    <div class="field"><label>Random delay (s):</label>
+      <input type="number" id="cfg-delay-min" min="0" max="10" step="0.1" value="0.5">
+      <span class="muted">to</span>
+      <input type="number" id="cfg-delay-max" min="0" max="10" step="0.1" value="2.0"></div>
+
+    <h2>Duration</h2>
+    <div class="field"><label>Mode:</label>
+      <div class="radios" id="cfg-duration">
+        <label><input type="radio" name="dm" value="time" checked> Time</label>
+        <label><input type="radio" name="dm" value="hit_count"> Hit count</label>
+        <label><input type="radio" name="dm" value="time_and_hit_count"> Time &amp; hit count</label>
+      </div></div>
+    <div class="field"><label>Time (s):</label>
+      <input type="number" id="cfg-duration-time" min="1" max="3600" step="1" value="60"></div>
+    <div class="field"><label>Hit count:</label>
+      <input type="number" id="cfg-duration-hits" min="1" max="9999" step="1" value="50"></div>
+    <div class="field"><label>Cycles:</label>
+      <input type="number" id="cfg-cycles" min="1" max="99" step="1" value="1"></div>
+
+    <div class="footer-row">
+      <button class="secondary" id="btn-config-back">← Back</button>
+      <button id="btn-config-start" class="big">Start drill →</button>
+    </div>
+  </section>
+
+  <!-- Run screen -->
+  <section id="screen-run" class="screen run">
+    <div class="drill-name" id="run-name">Drill</div>
+    <div class="counters">
+      <div class="counter hits">
+        <div class="num" id="run-hits">0</div>
+        <div class="lbl">HITS</div>
+      </div>
+      <div class="counter misses">
+        <div class="num" id="run-misses">0</div>
+        <div class="lbl">MISSES</div>
+      </div>
+    </div>
+    <div class="last" id="run-last">Tap pods as they light up.</div>
+    <div class="spacer"></div>
+    <button id="btn-abort" class="danger big">Abort</button>
+  </section>
+
+  <!-- Results screen -->
+  <section id="screen-results" class="screen results">
+    <h1 id="results-title">Results</h1>
+    <div class="spacer"></div>
+    <div class="big-number" id="results-big">—</div>
+    <div class="big-caption" id="results-caption"></div>
+    <div class="spacer"></div>
+    <div class="breakdown" id="results-detail"></div>
+    <div class="spacer"></div>
+    <div class="footer-row">
+      <button class="secondary" id="btn-results-menu">← Back to menu</button>
+      <button id="btn-results-again">Run again ↻</button>
+    </div>
+  </section>
+
+</div>
+
+<div id="toast" class="toast" style="display: none;"></div>
+
+<script type="module" src="js/ui.js"></script>
+</body>
+</html>

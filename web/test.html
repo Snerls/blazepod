@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BlazePod protocol tests</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0f1115; color: #e6e6e6; padding: 20px; }
+  h1 { color: #1f6feb; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; white-space: pre-wrap; }
+  .pass { color: #3fb950; }
+  .fail { color: #f85149; }
+  .summary { font-weight: 700; margin-top: 14px; font-size: 18px; }
+</style>
+</head>
+<body>
+<h1>BlazePod protocol tests</h1>
+<p>Cross-checks the JS port against the same vectors used by <code>tests/test_protocol.py</code>.</p>
+<pre id="out">running…</pre>
+<script type="module">
+import {
+  AUTH_PREFIX, buildAuthPayload, computeAuthSuffix, decodeTap,
+  encodeColor, COLOR_OFF, TAP_STATE, bytesToHex, hexToBytes,
+} from './js/protocol.js';
+
+const out = document.getElementById('out');
+let lines = [], pass = 0, fail = 0;
+
+function eq(name, actual, expected) {
+  const a = actual instanceof Uint8Array ? bytesToHex(actual) : String(actual);
+  const e = expected instanceof Uint8Array ? bytesToHex(expected) : String(expected);
+  if (a === e) { pass++; lines.push(`<span class="pass">PASS</span>  ${name}`); }
+  else { fail++; lines.push(`<span class="fail">FAIL</span>  ${name}\n      got      ${a}\n      expected ${e}`); }
+}
+
+const U32 = 0xFFFFFFFF;
+function refC(offset, body) {
+  const poly = (0xEDB88321 + (offset % 50)) >>> 0;
+  let crc = 0xFFFFFFFF;
+  for (const b of body) {
+    crc = (crc ^ b) >>> 0;
+    for (let i = 0; i < 8; i++) crc = (crc & 1) ? ((crc >>> 1) ^ poly) >>> 0 : (crc >>> 1) >>> 0;
+  }
+  crc = (crc ^ 0xFFFFFFFF) >>> 0;
+  crc = (crc + ((crc << 3) >>> 0)) >>> 0;
+  crc = (crc ^ (crc >>> 11)) >>> 0;
+  crc = (crc + ((crc << 15) >>> 0)) >>> 0;
+  return new Uint8Array([0x73,0x65,0x61, crc&0xFF,(crc>>>8)&0xFF,(crc>>>16)&0xFF,(crc>>>24)&0xFF]);
+}
+
+const README = hexToBytes('5A01DEADBEEF');
+
+eq('AUTH_PREFIX is "sea"', AUTH_PREFIX, new Uint8Array([0x73,0x65,0x61]));
+eq('payload starts with sea', buildAuthPayload(README).slice(0, 3), new Uint8Array([0x73,0x65,0x61]));
+eq('payload length 7', String(buildAuthPayload(README).length), '7');
+eq('matches C port (offset=1, DEADBEEF)', buildAuthPayload(README), refC(0x01, [0xDE,0xAD,0xBE,0xEF]));
+eq('leading bytes ignored', computeAuthSuffix(README), computeAuthSuffix(hexToBytes('00AABB5A01DEADBEEF')));
+
+for (const o of [0, 1, 25, 49, 50, 99, 200, 255]) {
+  const body = new Uint8Array([0x12,0x34,0x56,0x78]);
+  eq(`C-port match offset=${o}`, buildAuthPayload(new Uint8Array([o, ...body])), refC(o, body));
+}
+
+eq('encode red',   encodeColor(255,0,0), new Uint8Array([0,0,0xFF]));
+eq('encode green', encodeColor(0,255,0), new Uint8Array([0xFF,0,0]));
+eq('encode blue',  encodeColor(0,0,255), new Uint8Array([0,0xFF,0]));
+eq('off-on-tap appends 0x01', encodeColor(10,20,30,{offOnTap:true}), new Uint8Array([20,30,10,0x01]));
+eq('COLOR_OFF', COLOR_OFF, new Uint8Array([0,0,0]));
+
+{
+  const ev = decodeTap(hexToBytes('25A861000000000000').slice(0,8));
+  eq('lit_off state',     String(ev.state), String(TAP_STATE.LIT_OFF));
+  eq('lit_off elapsed_ms',String(ev.elapsedMs), String(0x61A8));
+}
+{
+  const ev = decodeTap(new Uint8Array([0x21,0xE8,0x03,0,0,0,0,0]));
+  eq('lit_stay state',     String(ev.state), String(TAP_STATE.LIT_STAY));
+  eq('lit_stay elapsed_ms',String(ev.elapsedMs), '1000');
+}
+
+try { computeAuthSuffix(new Uint8Array([0,1,2,3])); fail++; lines.push('<span class="fail">FAIL</span>  short mfr should throw'); }
+catch { pass++; lines.push('<span class="pass">PASS</span>  short mfr throws'); }
+try { decodeTap(new Uint8Array([0xFF,0,0,0,0,0,0,0])); fail++; lines.push('<span class="fail">FAIL</span>  unknown state should throw'); }
+catch { pass++; lines.push('<span class="pass">PASS</span>  unknown tap state throws'); }
+
+const summary = `<div class="summary ${fail === 0 ? 'pass' : 'fail'}">${pass} passed, ${fail} failed</div>`;
+out.innerHTML = lines.join('\n') + '\n' + summary;
+</script>
+</body>
+</html>
