@@ -23,3 +23,5 @@ ios/.sourcery/
 ios/DerivedData/
 *.xcuserstate
 .DS_Store
+
+.vercel
