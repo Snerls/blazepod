@@ -1,14 +1,20 @@
 # Project context for Claude
 
-Subscription-free BlazePod controller. Two parallel codebases sharing only the
-BLE protocol semantics:
+Subscription-free BlazePod controller. Three parallel codebases sharing only
+the BLE protocol semantics:
 
 - **`src/blazepod/`** — Python desktop app (Bleak + PyQt6). Runs on Windows/Mac/Linux.
-- **`web/`** — Web Bluetooth web app served from Vercel, used in the **Bluefy**
-  browser on iPhone (Safari does not support Web Bluetooth on iOS).
+- **`web/`** — Web app, source for both the Vercel deploy and the iOS app.
+  - In a desktop browser (Chrome): uses `pod-web.js` (Web Bluetooth).
+  - On iOS native app: uses `pod-cap.js` via Capacitor → CoreBluetooth.
+  - In iOS Safari/Bluefy: doesn't work (Apple strips manufacturerData;
+    documented + verified live).
+- **`ios/`** — Capacitor-generated Xcode project. Built on a Mac. See
+  [IOS_SETUP.md](IOS_SETUP.md).
 
-Hosted at `https://web-psi-silk-uz4uykpau7.vercel.app`. Push to `main` (or run
-`vercel --prod` from `web/`) to redeploy.
+Vercel: `https://web-psi-silk-uz4uykpau7.vercel.app` — auto-deploys from the
+`main` branch via the GitHub integration. Vercel's build runs `npm run build`
+(Vite) and serves `dist/`.
 
 ## Live BLE testing
 

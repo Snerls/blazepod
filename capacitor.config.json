@@ -1,0 +1,20 @@
+{
+  "appId": "dk.snerls.blazepod",
+  "appName": "BlazePod",
+  "webDir": "dist",
+  "ios": {
+    "contentInset": "always",
+    "scheme": "BlazePod",
+    "backgroundColor": "#0f1115"
+  },
+  "plugins": {
+    "BluetoothLe": {
+      "displayStrings": {
+        "scanning": "Looking for BlazePods…",
+        "cancel": "Cancel",
+        "availableDevices": "Pods nearby",
+        "noDeviceFound": "No BlazePods found"
+      }
+    }
+  }
+}
