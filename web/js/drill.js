@@ -99,7 +99,7 @@ export class CustomDrill {
     this.stats = makeStats('Custom');
     this._abort = new AbortController();
 
-    const pods = manager.values();
+    const pods = manager.connected ? manager.connected() : manager.values();
     const need = config.stations * config.podsPerStation;
     if (need > pods.length) {
       throw new Error(`need ${need} pods (${config.stations} × ${config.podsPerStation}), only ${pods.length} connected`);

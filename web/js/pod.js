@@ -5,10 +5,39 @@
 import {
   AUTH_PREFIX, COLOR_CHAR_UUID, COLOR_OFF, COLOR_SERVICE_UUID,
   TAP_CHAR_UUID, TAP_SERVICE_UUID, UART_RX_CHAR_UUID, UART_SERVICE_UUID,
-  buildAuthPayload, decodeTap, encodeColor, toUint8Array,
+  buildAuthPayload, bytesToHex, decodeTap, encodeColor, hexToBytes, toUint8Array,
 } from './protocol.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Persistent cache of per-pod manufacturer data (the input to the auth handshake).
+// mfrData is derived from the pod's hardware identity and never changes, so we can
+// skip the slow watchAdvertisements + tap-to-wake dance on every reconnect.
+const MFR_CACHE_KEY = 'blazepod.mfr.v1';
+
+export const mfrCache = {
+  _read() {
+    try { return JSON.parse(localStorage.getItem(MFR_CACHE_KEY) || '{}') || {}; }
+    catch { return {}; }
+  },
+  _write(obj) {
+    try { localStorage.setItem(MFR_CACHE_KEY, JSON.stringify(obj)); } catch {}
+  },
+  get(deviceId) {
+    const hex = this._read()[deviceId];
+    return hex ? hexToBytes(hex) : null;
+  },
+  set(deviceId, bytes) {
+    const obj = this._read();
+    obj[deviceId] = bytesToHex(bytes);
+    this._write(obj);
+  },
+  forget(deviceId) {
+    const obj = this._read();
+    if (deviceId in obj) { delete obj[deviceId]; this._write(obj); }
+  },
+  clear() { this._write({}); },
+};
 
 function pickMfrDataFromAdvertisement(event) {
   // event.manufacturerData is a Map<number, DataView>
@@ -24,7 +53,9 @@ function pickMfrDataFromAdvertisement(event) {
 }
 
 // Wait for one advertisement that carries usable manufacturer data.
-async function awaitMfrData(device, timeoutMs = 8000) {
+// On iOS, pods sleep aggressively — caller should prompt the user to tap
+// the pod after picker selection so it broadcasts a fresh advertisement.
+async function awaitMfrData(device, { timeoutMs = 10000, onWaiting } = {}) {
   if (!device.watchAdvertisements) {
     throw new Error("Browser doesn't support watchAdvertisements (use Bluefy on iOS).");
   }
@@ -49,10 +80,13 @@ async function awaitMfrData(device, timeoutMs = 8000) {
       device.removeEventListener('advertisementreceived', onAd);
       return reject(e);
     }
+    if (onWaiting) {
+      try { onWaiting(); } catch {}
+    }
     setTimeout(() => {
       if (!done) {
         device.removeEventListener('advertisementreceived', onAd);
-        reject(new Error(`no manufacturer data within ${timeoutMs}ms — wake the pod and try again`));
+        reject(new Error(`pod didn't broadcast within ${Math.round(timeoutMs / 1000)}s — tap the pod hard, then try again`));
       }
     }, timeoutMs);
   });
@@ -70,6 +104,11 @@ export class Pod {
     this._connected = false;
     this._notifyHandler = (event) => this._onNotify(event);
     device.addEventListener('gattserverdisconnected', () => { this._connected = false; });
+
+    // Pre-seed the per-device cache from persistent storage so awaitMfrData
+    // resolves instantly on every reconnect after the first.
+    const cached = mfrCache.get(device.id);
+    if (cached) device._cachedMfr = cached;
   }
 
   get isConnected() { return this._connected && this.server?.connected === true; }
@@ -77,12 +116,12 @@ export class Pod {
   onTap(cb) { this._listeners.add(cb); return () => this._listeners.delete(cb); }
   clearTapListeners() { this._listeners.clear(); }
 
-  async connect({ retries = 2 } = {}) {
+  async connect({ retries = 2, onWaiting } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         if (attempt > 0) await sleep(500);
-        await this._connectOnce();
+        await this._connectOnce({ onWaiting });
         return;
       } catch (e) {
         lastErr = e;
@@ -92,13 +131,23 @@ export class Pod {
     throw lastErr;
   }
 
-  async _connectOnce() {
-    this.mfrData = await awaitMfrData(this.device);
+  async _connectOnce({ onWaiting } = {}) {
+    this.mfrData = await awaitMfrData(this.device, { onWaiting });
     this.server = await this.device.gatt.connect();
 
     const uart   = await this.server.getPrimaryService(UART_SERVICE_UUID);
     const rxChar = await uart.getCharacteristic(UART_RX_CHAR_UUID);
-    await rxChar.writeValueWithResponse(buildAuthPayload(this.mfrData));
+    try {
+      await rxChar.writeValueWithResponse(buildAuthPayload(this.mfrData));
+    } catch (e) {
+      // Auth write failed — most likely cause is a stale cached mfrData.
+      // Drop the cached value, drop the in-memory shortcut, and disconnect so
+      // the outer retry loop picks up a fresh advertisement next attempt.
+      mfrCache.forget(this.device.id);
+      delete this.device._cachedMfr;
+      try { this.device.gatt.disconnect(); } catch {}
+      throw e;
+    }
 
     const tap = await this.server.getPrimaryService(TAP_SERVICE_UUID);
     this._tapChar = await tap.getCharacteristic(TAP_CHAR_UUID);
@@ -108,6 +157,9 @@ export class Pod {
     // Pre-fetch the color characteristic so writes are fast in drills
     const colorService = await this.server.getPrimaryService(COLOR_SERVICE_UUID);
     this._colorChar = await colorService.getCharacteristic(COLOR_CHAR_UUID);
+
+    // Auth succeeded — persist mfrData so future sessions skip watchAdvertisements.
+    mfrCache.set(this.device.id, this.mfrData);
 
     this._connected = true;
   }

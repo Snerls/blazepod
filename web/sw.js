@@ -1,5 +1,6 @@
-// Cache-first service worker so the app loads when offline (e.g. at the gym).
-const CACHE = 'blazepod-v1';
+// Network-first for HTML/JS (so updates ship immediately), cache fallback for offline use.
+// Bumping CACHE name invalidates every previously-cached file.
+const CACHE = 'blazepod-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -23,17 +24,25 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// Network-first for everything: always try the network, fall back to cache when offline.
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  if (url.origin !== self.location.origin) return; // skip cross-origin
-  e.respondWith(
-    caches.match(e.request).then((hit) => hit || fetch(e.request).then((resp) => {
-      // Cache same-origin GETs as we see them
-      if (e.request.method === 'GET' && resp.ok) {
+  if (url.origin !== self.location.origin) return;
+  if (e.request.method !== 'GET') return;
+  e.respondWith((async () => {
+    try {
+      const resp = await fetch(e.request);
+      if (resp.ok) {
         const clone = resp.clone();
         caches.open(CACHE).then((c) => c.put(e.request, clone)).catch(() => {});
       }
       return resp;
-    }).catch(() => caches.match('./index.html')))
-  );
+    } catch {
+      const hit = await caches.match(e.request);
+      if (hit) return hit;
+      const fallback = await caches.match('./index.html');
+      if (fallback && e.request.mode === 'navigate') return fallback;
+      throw new Error('offline and not cached');
+    }
+  })());
 });

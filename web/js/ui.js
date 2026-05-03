@@ -1,6 +1,6 @@
 // Screen routing + form state + drill control.
 
-import { Pod, pickPod } from './pod.js';
+import { Pod, mfrCache, pickPod } from './pod.js';
 import { PodManager } from './manager.js';
 import {
   CustomDrill, DurationMode, LightDelay, LightsOut,
@@ -42,34 +42,66 @@ function toast(msg, kind) {
 
 // ---------- Pods screen ----------
 
+const podStatus = new Map(); // address -> 'saved' | 'connecting' | 'waiting' | 'connected' | 'failed'
+
 function refreshPodList() {
   const list = $('#pods-list');
   list.innerHTML = '';
   const pods = manager.values();
+  const connectedN = manager.connectedCount;
   if (pods.length === 0) {
-    $('#pods-status').textContent = 'No pods yet. Tap "+ Add pod" and pick one from the list.';
+    $('#pods-status').textContent = 'No pods yet. Tap "+ Add pod (first time)" and pick one from the picker.';
   } else {
-    $('#pods-status').textContent = `${pods.length} pod(s) connected.`;
+    $('#pods-status').textContent = `${connectedN}/${pods.length} pod(s) connected.`;
   }
   for (const pod of pods) {
+    const state = podStatus.get(pod.address) || (pod.isConnected ? 'connected' : 'saved');
     const row = document.createElement('div');
-    row.className = 'pod-item ' + (pod.isConnected ? 'connected' : 'failed');
+    row.className = 'pod-item ' + (state === 'connected' ? 'connected' : (state === 'failed' ? 'failed' : ''));
+    const stateLabel = ({
+      saved:      '(saved — tap Connect)',
+      connecting: '(connecting…)',
+      waiting:    '(WAITING — TAP THE POD)',
+      connected:  '(connected)',
+      failed:     '(failed — try again)',
+    })[state] || '';
     row.innerHTML = `
       <div>
-        <div class="name">${escapeHtml(pod.name)}</div>
+        <div class="name">${escapeHtml(pod.name)} <span class="muted">${stateLabel}</span></div>
         <div class="addr">${pod.address}</div>
       </div>
       <div class="pod-actions">
-        <button class="secondary flash-btn">Flash</button>
+        ${pod.isConnected
+          ? `<button class="secondary flash-btn">Flash</button>`
+          : `<button class="connect-btn">Connect</button>`}
         <button class="secondary remove-btn">Remove</button>
       </div>`;
-    row.querySelector('.flash-btn').onclick = async () => {
+    const flashBtn = row.querySelector('.flash-btn');
+    if (flashBtn) flashBtn.onclick = async () => {
       try { await pod.flash(255, 0, 0, { count: 3 }); } catch (e) { toast(`Flash failed: ${e.message}`, 'error'); }
     };
-    row.querySelector('.remove-btn').onclick = async () => {
-      manager.remove(pod.address);
+    const connectBtn = row.querySelector('.connect-btn');
+    if (connectBtn) connectBtn.onclick = async () => {
+      podStatus.set(pod.address, 'connecting');
       refreshPodList();
-      refreshPodControls();
+      try {
+        await pod.connect({ onWaiting: () => { podStatus.set(pod.address, 'waiting'); refreshPodList(); } });
+        podStatus.set(pod.address, 'connected');
+        try { await pod.flash(0, 200, 0, { count: 1, onMs: 250 }); } catch {}
+      } catch (e) {
+        podStatus.set(pod.address, 'failed');
+        toast(`${pod.name}: ${e.message}`, 'error');
+      } finally {
+        refreshPodList();
+      }
+    };
+    row.querySelector('.remove-btn').onclick = async () => {
+      try { await pod.disconnect(); } catch {}
+      // Web Bluetooth has no API to revoke pairing — Bluefy/Chrome remember the device permanently.
+      // Removing here just drops it from this session.
+      manager.remove(pod.address);
+      podStatus.delete(pod.address);
+      refreshPodList();
     };
     list.appendChild(row);
   }
@@ -77,32 +109,120 @@ function refreshPodList() {
 }
 
 function refreshPodControls() {
-  const n = manager.size;
-  $('#btn-identify').disabled = n === 0;
-  $('#btn-disconnect').disabled = n === 0;
-  $('#btn-go-menu').disabled = n === 0;
+  const total = manager.size;
+  const connected = manager.connectedCount;
+  const disconnected = total - connected;
+  $('#btn-connect-all').disabled = disconnected === 0;
+  $('#btn-connect-all').textContent = disconnected > 0 ? `Connect all (${disconnected})` : 'All connected';
+  $('#btn-identify').disabled = connected === 0;
+  $('#btn-disconnect').disabled = connected === 0;
+  $('#btn-go-menu').disabled = connected === 0;
+}
+
+// Auto-loop: after a successful add, immediately re-open the picker so the
+// user can chain through all 6 pods without going back to the homescreen.
+// User exits the loop by cancelling the picker (back/escape on iOS).
+async function addOnePod() {
+  toast('TAP the pod once to wake it, then pick it from the list', 'warn');
+  const device = await pickPod(); // throws NotFoundError if user cancels
+  if (manager.pods.has(device.id)) {
+    toast(`${device.name || device.id} already added`, 'warn');
+    return { added: false, cancelled: false };
+  }
+  const pod = new Pod(device);
+  manager.add(pod);
+  podStatus.set(pod.address, 'connecting');
+  refreshPodList();
+  try {
+    await pod.connect({
+      onWaiting: () => {
+        podStatus.set(pod.address, 'waiting');
+        refreshPodList();
+        toast('Waiting — TAP THE POD HARD NOW (10s window)', 'warn');
+      },
+    });
+    podStatus.set(pod.address, 'connected');
+    try { await pod.flash(0, 200, 0, { count: 1, onMs: 250 }); } catch {}
+    refreshPodList();
+    return { added: true, cancelled: false };
+  } catch (e) {
+    podStatus.set(pod.address, 'failed');
+    refreshPodList();
+    toast(`${pod.name}: ${e.message}`, 'error');
+    console.error(e);
+    return { added: false, cancelled: false };
+  }
 }
 
 $('#btn-add-pod').onclick = async () => {
+  const btn = $('#btn-add-pod');
+  btn.disabled = true;
+  let added = 0;
   try {
-    const device = await pickPod();
-    if (manager.pods.has(device.id)) {
-      toast(`${device.name || device.id} already added`, 'warn');
-      return;
+    while (true) {
+      try {
+        const result = await addOnePod();
+        if (result.added) {
+          added++;
+          toast(`Added ${added} pod(s) — pick the next, or cancel to stop`);
+          // brief pause so the toast is readable before iOS reopens the picker
+          await new Promise((r) => setTimeout(r, 600));
+        } else if (result.cancelled) {
+          break;
+        }
+        // either added=false (failed/duplicate) or added=true: continue loop
+      } catch (e) {
+        if (e?.name === 'NotFoundError') break; // picker cancelled → exit loop
+        toast(`Add failed: ${e.message}`, 'error');
+        console.error(e);
+        break;
+      }
     }
-    const pod = new Pod(device);
-    toast(`Connecting to ${device.name || 'pod'}…`);
-    await pod.connect();
-    manager.add(pod);
-    toast(`Connected ${pod.name}`);
-    try { await pod.flash(0, 200, 0, { count: 1, onMs: 250 }); } catch {}
-    refreshPodList();
-  } catch (e) {
-    if (e?.name === 'NotFoundError') return; // user cancelled the picker
-    toast(`Add failed: ${e.message}`, 'error');
-    console.error(e);
+  } finally {
+    btn.disabled = false;
+    if (added > 0) toast(`Done — ${added} pod(s) added this round`);
   }
 };
+
+$('#btn-connect-all').onclick = async () => {
+  const btn = $('#btn-connect-all');
+  btn.disabled = true;
+  try {
+    const failed = await manager.connectAll({
+      onPodEvent: (pod, state) => {
+        podStatus.set(pod.address, state);
+        refreshPodList();
+        if (state === 'waiting') toast(`${pod.name}: TAP IT to wake (up to 30s)`, 'warn');
+      },
+    });
+    if (failed.length === 0) {
+      toast(`All ${manager.connectedCount} connected`);
+    } else {
+      toast(`${manager.connectedCount} connected, ${failed.length} failed — tap and retry`, 'warn');
+    }
+  } finally {
+    refreshPodList();
+  }
+};
+
+// Restore any pods this origin has been granted permission to in past sessions.
+async function restoreSavedPods() {
+  if (!navigator.bluetooth?.getDevices) return;
+  let devices = [];
+  try { devices = await navigator.bluetooth.getDevices(); } catch (e) { console.warn('getDevices failed', e); return; }
+  let added = 0;
+  for (const device of devices) {
+    if (manager.pods.has(device.id)) continue;
+    const pod = new Pod(device);
+    manager.add(pod);
+    podStatus.set(pod.address, 'saved');
+    added++;
+  }
+  if (added > 0) {
+    refreshPodList();
+    toast(`${added} saved pod(s) — tap "Connect all" to reconnect`, 'warn');
+  }
+}
 
 $('#btn-identify').onclick = async () => {
   if (manager.size === 0) return;
@@ -119,6 +239,13 @@ $('#btn-identify').onclick = async () => {
 $('#btn-disconnect').onclick = async () => {
   await manager.disconnectAll();
   refreshPodList();
+};
+
+$('#btn-forget-cache').onclick = () => {
+  mfrCache.clear();
+  // Drop in-memory shortcut on every Pod's underlying device too
+  for (const pod of manager.values()) { try { delete pod.device._cachedMfr; } catch {} }
+  toast('Cleared cached auth data — next connect will re-read advertisements');
 };
 
 $('#btn-go-menu').onclick = () => show('menu');
@@ -404,8 +531,13 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-// Initial render
+// Initial render + restore previously-paired pods
 refreshPodList();
+restoreSavedPods();
+
+// Surface unhandled errors so we never have a "nothing happens" failure mode again.
+window.addEventListener('error', (e) => toast(`JS error: ${e.message}`, 'error'));
+window.addEventListener('unhandledrejection', (e) => toast(`Promise error: ${e.reason?.message || e.reason}`, 'error'));
 
 // Service worker (best-effort; silently fails on file://)
 if ('serviceWorker' in navigator) {
