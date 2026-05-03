@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BlazePod Bluefy diagnostic</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; font-family: -apple-system, system-ui, sans-serif; background: #0f1115; color: #e6e6e6; }
+  h1 { margin: 0 0 8px; font-size: 18px; }
+  p.muted { color: #8b949e; font-size: 13px; margin: 0 0 12px; }
+  .grid { display: grid; gap: 8px; margin-bottom: 12px; }
+  button { appearance: none; background: #1f6feb; color: white; border: 0; border-radius: 8px;
+           padding: 12px; font-size: 15px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  button:active { background: #1158c7; }
+  button:disabled { background: #30363d; color: #8b949e; }
+  button.sec { background: #30363d; }
+  input[type=text] { background: #161b22; color: #e6e6e6; border: 1px solid #30363d;
+                     border-radius: 6px; padding: 10px; font-size: 14px; font-family: ui-monospace, Menlo, monospace; width: 100%; }
+  .log {
+    background: #0a0c10; border: 1px solid #30363d; border-radius: 8px;
+    padding: 10px; min-height: 240px; max-height: 50vh; overflow-y: auto;
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.45;
+    white-space: pre-wrap; color: #d0d7de;
+  }
+  .log .h { color: #58a6ff; font-weight: 700; }
+  .log .ok { color: #3fb950; }
+  .log .err { color: #f85149; }
+  .log .warn { color: #d29922; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #161b22; border: 1px solid #30363d; font-size: 11px; color: #8b949e; margin-left: 6px; }
+</style>
+</head>
+<body>
+
+<h1>BlazePod / Bluefy diagnostic <span class="pill" id="ua-pill">…</span></h1>
+<p class="muted">Run the steps in order. After each, the log fills. When done, tap "Copy log" and paste the whole thing back to me.</p>
+
+<div class="grid">
+  <button id="b1">1. Show capabilities</button>
+  <button id="b2">2. Pick a pod (requestDevice)</button>
+  <button id="b3">3. Watch advertisements (15s) — TAP THE POD HARD during this</button>
+  <button id="b4">4. GATT connect</button>
+  <button id="b5">5. List services</button>
+  <input id="mfr-input" type="text" placeholder="hex mfrData (e.g. 5A01DEADBEEF) — paste from step 3 if available">
+  <button id="b6">6. Manual auth write (uses field above)</button>
+  <button id="b7">7. Subscribe to taps — then tap pod 3x</button>
+  <button id="b8">8. Light pod red 1s</button>
+  <button id="b9">9. List saved devices (getDevices)</button>
+  <div class="row">
+    <button class="sec" id="b-clear">Clear log</button>
+    <button class="sec" id="b-copy">Copy log</button>
+  </div>
+</div>
+
+<div class="log" id="log">ready.\n</div>
+
+<script type="module">
+import {
+  UART_SERVICE_UUID, UART_RX_CHAR_UUID,
+  COLOR_SERVICE_UUID, COLOR_CHAR_UUID,
+  TAP_SERVICE_UUID, TAP_CHAR_UUID,
+  COLOR_OFF, buildAuthPayload, decodeTap, encodeColor,
+  bytesToHex, hexToBytes, toUint8Array,
+} from './js/protocol.js';
+
+const logEl = document.getElementById('log');
+function log(line, cls) {
+  const t = new Date().toISOString().slice(11, 23);
+  const span = `<span${cls ? ` class="${cls}"` : ''}>${t}  ${line}</span>\n`;
+  logEl.innerHTML += span;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function header(text) { log(`\n=== ${text} ===`, 'h'); }
+function ok(text)  { log(`OK   ${text}`, 'ok'); }
+function err(text) { log(`ERR  ${text}`, 'err'); }
+function warn(text){ log(`WARN ${text}`, 'warn'); }
+
+// Surface uncaught issues so nothing is silent.
+window.addEventListener('error', (e) => err(`window.error: ${e.message}  (${e.filename}:${e.lineno})`));
+window.addEventListener('unhandledrejection', (e) => err(`unhandledrejection: ${e.reason?.message || e.reason}`));
+
+// Show a short user-agent pill at the top so we know which Bluefy build was used
+document.getElementById('ua-pill').textContent = navigator.userAgent.slice(0, 60);
+
+// Shared state across steps
+const S = {
+  device: null, mfrFromAd: null, server: null,
+  uart: null, color: null, tap: null,
+  rxChar: null, colorChar: null, tapChar: null,
+  notifHandler: null,
+};
+
+// --- 1. Capabilities ---
+document.getElementById('b1').onclick = () => {
+  header('STEP 1: capabilities');
+  log(`navigator.bluetooth: ${!!navigator.bluetooth}`);
+  if (!navigator.bluetooth) { err('Web Bluetooth not available — use Bluefy on iOS'); return; }
+  log(`requestDevice:        ${typeof navigator.bluetooth.requestDevice}`);
+  log(`requestLEScan:        ${typeof navigator.bluetooth.requestLEScan}`);
+  log(`getDevices:           ${typeof navigator.bluetooth.getDevices}`);
+  log(`getAvailability:      ${typeof navigator.bluetooth.getAvailability}`);
+  // Probe a hypothetical device to see if watchAdvertisements is on the prototype
+  try {
+    const proto = window.BluetoothDevice?.prototype;
+    log(`BluetoothDevice.proto.watchAdvertisements: ${typeof proto?.watchAdvertisements}`);
+  } catch (e) { warn(`prototype probe failed: ${e.message}`); }
+  log(`userAgent: ${navigator.userAgent}`);
+  log(`origin:    ${location.origin}`);
+  if (navigator.bluetooth.getAvailability) {
+    navigator.bluetooth.getAvailability().then((b) => log(`bluetooth available: ${b}`));
+  }
+};
+
+// --- 2. Pick device ---
+document.getElementById('b2').onclick = async () => {
+  header('STEP 2: requestDevice');
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'BlazePod' }],
+      optionalServices: [UART_SERVICE_UUID, COLOR_SERVICE_UUID, TAP_SERVICE_UUID],
+    });
+    S.device = device;
+    ok(`got device`);
+    log(`  device.id   = ${device.id}`);
+    log(`  device.name = ${device.name || '(none)'}`);
+    log(`  watchAdvertisements present: ${typeof device.watchAdvertisements === 'function'}`);
+    log(`  gatt present:                ${!!device.gatt}`);
+  } catch (e) {
+    err(`requestDevice failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- 3. Watch advertisements ---
+document.getElementById('b3').onclick = async () => {
+  header('STEP 3: watchAdvertisements (15s)');
+  if (!S.device) { err('pick a device first (step 2)'); return; }
+  if (typeof S.device.watchAdvertisements !== 'function') {
+    err('device.watchAdvertisements is not a function on this device — Bluefy may not implement it');
+    return;
+  }
+
+  let count = 0;
+  let mfrCount = 0;
+  let firstMfr = null;
+
+  const onAd = (ev) => {
+    count++;
+    const mfrEntries = [];
+    if (ev.manufacturerData && typeof ev.manufacturerData.forEach === 'function') {
+      ev.manufacturerData.forEach((dv, key) => {
+        try {
+          const bytes = toUint8Array(dv);
+          mfrEntries.push(`id=0x${key.toString(16).padStart(4, '0')} bytes=${bytesToHex(bytes)} (${bytes.length}B)`);
+          if (!firstMfr && bytes.length >= 5) firstMfr = bytes;
+        } catch (e) { mfrEntries.push(`(decode error: ${e.message})`); }
+      });
+    }
+    if (mfrEntries.length > 0) mfrCount++;
+    const sds = [];
+    if (ev.serviceData && typeof ev.serviceData.forEach === 'function') {
+      ev.serviceData.forEach((dv, key) => {
+        try { sds.push(`${key}=${bytesToHex(toUint8Array(dv))}`); } catch {}
+      });
+    }
+    log(`  AD #${count} rssi=${ev.rssi ?? '?'} name='${ev.name || ev.device?.name || '?'}' uuids=[${(ev.uuids || []).join(', ')}]`);
+    if (mfrEntries.length) {
+      for (const line of mfrEntries) log(`     mfr: ${line}`);
+    } else {
+      log(`     mfr: (empty)`);
+    }
+    if (sds.length) log(`     svc: ${sds.join(' | ')}`);
+  };
+
+  S.device.addEventListener('advertisementreceived', onAd);
+  try {
+    await S.device.watchAdvertisements();
+    log('watchAdvertisements() resolved — listening for 15s');
+    log('==> TAP THE POD HARD NOW, repeatedly, until time is up <==', 'warn');
+  } catch (e) {
+    err(`watchAdvertisements threw: ${e?.name || ''} ${e?.message || e}`);
+    S.device.removeEventListener('advertisementreceived', onAd);
+    return;
+  }
+
+  await new Promise((r) => setTimeout(r, 15000));
+  S.device.removeEventListener('advertisementreceived', onAd);
+
+  log(`\nsummary: ${count} advertisement event(s), ${mfrCount} with manufacturerData`);
+  if (firstMfr) {
+    S.mfrFromAd = firstMfr;
+    document.getElementById('mfr-input').value = bytesToHex(firstMfr);
+    ok(`mfrData captured: ${bytesToHex(firstMfr)}  — auto-filled into Step 6 field`);
+  } else if (count === 0) {
+    err('NO ADVERTISEMENT EVENTS FIRED — Branch C: watchAdvertisements not delivering on Bluefy/iOS');
+  } else {
+    err('Got events but NO manufacturerData — Branch B: iOS strips manufacturer-specific data');
+  }
+};
+
+// --- 4. GATT connect ---
+document.getElementById('b4').onclick = async () => {
+  header('STEP 4: gatt.connect');
+  if (!S.device) { err('pick a device first (step 2)'); return; }
+  try {
+    const t0 = performance.now();
+    S.server = await S.device.gatt.connect();
+    const dt = performance.now() - t0;
+    ok(`connected in ${dt.toFixed(0)}ms  (server.connected=${S.server.connected})`);
+  } catch (e) {
+    err(`gatt.connect failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- 5. List services ---
+document.getElementById('b5').onclick = async () => {
+  header('STEP 5: getPrimaryServices');
+  if (!S.server || !S.server.connected) { err('not connected — run step 4 first'); return; }
+  try {
+    const services = await S.server.getPrimaryServices();
+    log(`got ${services.length} service(s):`);
+    let foundUart = false, foundColor = false, foundTap = false;
+    for (const s of services) {
+      const u = s.uuid.toLowerCase();
+      let tag = '';
+      if (u === UART_SERVICE_UUID)  { foundUart = true; tag = '  <-- UART'; }
+      if (u === COLOR_SERVICE_UUID) { foundColor = true; tag = '  <-- COLOR'; }
+      if (u === TAP_SERVICE_UUID)   { foundTap = true; tag = '  <-- TAP'; }
+      log(`  ${s.uuid}${tag}`);
+    }
+    if (foundUart && foundColor && foundTap) ok('all 3 expected services present');
+    else err(`missing: ${[!foundUart && 'UART', !foundColor && 'COLOR', !foundTap && 'TAP'].filter(Boolean).join(', ')}`);
+
+    if (foundUart) S.uart = await S.server.getPrimaryService(UART_SERVICE_UUID);
+    if (foundColor) S.color = await S.server.getPrimaryService(COLOR_SERVICE_UUID);
+    if (foundTap)  S.tap   = await S.server.getPrimaryService(TAP_SERVICE_UUID);
+  } catch (e) {
+    err(`getPrimaryServices failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- 6. Manual auth write ---
+document.getElementById('b6').onclick = async () => {
+  header('STEP 6: write auth payload to UART RX');
+  if (!S.uart) { err('UART service missing — run step 5 first'); return; }
+  const hex = document.getElementById('mfr-input').value.trim();
+  if (!hex) { err('paste mfrData hex into the field above'); return; }
+  let mfr;
+  try { mfr = hexToBytes(hex); } catch (e) { err(`bad hex: ${e.message}`); return; }
+  log(`  using mfrData: ${bytesToHex(mfr)} (${mfr.length}B)`);
+  let payload;
+  try { payload = buildAuthPayload(mfr); }
+  catch (e) { err(`buildAuthPayload threw: ${e.message}`); return; }
+  log(`  auth payload:  ${bytesToHex(payload)}`);
+  try {
+    S.rxChar = await S.uart.getCharacteristic(UART_RX_CHAR_UUID);
+    log(`  rxChar.writeValueWithResponse: ${typeof S.rxChar.writeValueWithResponse}`);
+    log(`  rxChar.writeValue:             ${typeof S.rxChar.writeValue}`);
+    if (S.rxChar.writeValueWithResponse) {
+      await S.rxChar.writeValueWithResponse(payload);
+    } else {
+      await S.rxChar.writeValue(payload);
+    }
+    ok('auth write succeeded');
+  } catch (e) {
+    err(`write failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- 7. Tap notifications ---
+document.getElementById('b7').onclick = async () => {
+  header('STEP 7: subscribe to tap notifications');
+  if (!S.tap) { err('TAP service missing — run step 5 first'); return; }
+  try {
+    S.tapChar = await S.tap.getCharacteristic(TAP_CHAR_UUID);
+    if (S.notifHandler) S.tapChar.removeEventListener('characteristicvaluechanged', S.notifHandler);
+    let n = 0;
+    S.notifHandler = (ev) => {
+      n++;
+      const bytes = toUint8Array(ev.target.value);
+      log(`  TAP #${n} raw=${bytesToHex(bytes)}`);
+      try {
+        const dec = decodeTap(bytes);
+        log(`         decoded: state=0x${dec.state.toString(16).padStart(2, '0')} elapsed_ms=${dec.elapsedMs} hitLitPod=${dec.hitLitPod}`);
+      } catch (e) { warn(`         decode failed: ${e.message}`); }
+    };
+    S.tapChar.addEventListener('characteristicvaluechanged', S.notifHandler);
+    await S.tapChar.startNotifications();
+    ok('subscribed — TAP THE POD 3 TIMES NOW');
+  } catch (e) {
+    err(`subscribe failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- 8. Light pod red 1s ---
+document.getElementById('b8').onclick = async () => {
+  header('STEP 8: write color = red, hold 1s, then off');
+  if (!S.color) { err('COLOR service missing — run step 5 first'); return; }
+  try {
+    S.colorChar = await S.color.getCharacteristic(COLOR_CHAR_UUID);
+    const data = encodeColor(255, 0, 0);
+    log(`  color bytes: ${bytesToHex(data)}`);
+    if (S.colorChar.writeValueWithoutResponse) {
+      await S.colorChar.writeValueWithoutResponse(data);
+    } else {
+      await S.colorChar.writeValue(data);
+    }
+    log('  written — pod should be RED now');
+    await new Promise((r) => setTimeout(r, 1000));
+    if (S.colorChar.writeValueWithoutResponse) {
+      await S.colorChar.writeValueWithoutResponse(COLOR_OFF);
+    } else {
+      await S.colorChar.writeValue(COLOR_OFF);
+    }
+    ok('off — visually confirm pod lit red then turned off');
+  } catch (e) {
+    err(`color write failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- 9. getDevices ---
+document.getElementById('b9').onclick = async () => {
+  header('STEP 9: navigator.bluetooth.getDevices()');
+  if (!navigator.bluetooth?.getDevices) { err('getDevices not supported by this browser'); return; }
+  try {
+    const devices = await navigator.bluetooth.getDevices();
+    log(`got ${devices.length} saved device(s):`);
+    for (const d of devices) {
+      log(`  id=${d.id}  name=${d.name || '(none)'}`);
+    }
+    if (S.device) {
+      const sameId = devices.find((d) => d.id === S.device.id);
+      if (sameId) ok(`step-2 device.id IS in saved list (id is stable across this session)`);
+      else err(`step-2 device.id NOT in saved list — id may not be stable on Bluefy`);
+    }
+  } catch (e) {
+    err(`getDevices failed: ${e?.name || ''} ${e?.message || e}`);
+  }
+};
+
+// --- log controls ---
+document.getElementById('b-clear').onclick = () => { logEl.textContent = 'cleared.\n'; };
+document.getElementById('b-copy').onclick = async () => {
+  const text = logEl.textContent || logEl.innerText || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    log('(log copied to clipboard)', 'ok');
+  } catch (e) {
+    // Fallback: select the log so the user can long-press to copy
+    const r = document.createRange();
+    r.selectNodeContents(logEl);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+    warn('clipboard API blocked — log is selected, long-press to Copy');
+  }
+};
+</script>
+
+</body>
+</html>

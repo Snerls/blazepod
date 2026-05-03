@@ -50,7 +50,7 @@ function refreshPodList() {
   const pods = manager.values();
   const connectedN = manager.connectedCount;
   if (pods.length === 0) {
-    $('#pods-status').textContent = 'No pods yet. Tap "+ Add pod (first time)" and pick one from the picker.';
+    $('#pods-status').textContent = 'No pods yet. Tap "+ Add pods" and pick one from the picker.';
   } else {
     $('#pods-status').textContent = `${connectedN}/${pods.length} pod(s) connected.`;
   }
@@ -61,7 +61,6 @@ function refreshPodList() {
     const stateLabel = ({
       saved:      '(saved — tap Connect)',
       connecting: '(connecting…)',
-      waiting:    '(WAITING — TAP THE POD)',
       connected:  '(connected)',
       failed:     '(failed — try again)',
     })[state] || '';
@@ -85,7 +84,7 @@ function refreshPodList() {
       podStatus.set(pod.address, 'connecting');
       refreshPodList();
       try {
-        await pod.connect({ onWaiting: () => { podStatus.set(pod.address, 'waiting'); refreshPodList(); } });
+        await pod.connect();
         podStatus.set(pod.address, 'connected');
         try { await pod.flash(0, 200, 0, { count: 1, onMs: 250 }); } catch {}
       } catch (e) {
@@ -123,7 +122,6 @@ function refreshPodControls() {
 // user can chain through all 6 pods without going back to the homescreen.
 // User exits the loop by cancelling the picker (back/escape on iOS).
 async function addOnePod() {
-  toast('TAP the pod once to wake it, then pick it from the list', 'warn');
   const device = await pickPod(); // throws NotFoundError if user cancels
   if (manager.pods.has(device.id)) {
     toast(`${device.name || device.id} already added`, 'warn');
@@ -134,13 +132,7 @@ async function addOnePod() {
   podStatus.set(pod.address, 'connecting');
   refreshPodList();
   try {
-    await pod.connect({
-      onWaiting: () => {
-        podStatus.set(pod.address, 'waiting');
-        refreshPodList();
-        toast('Waiting — TAP THE POD HARD NOW (10s window)', 'warn');
-      },
-    });
+    await pod.connect();
     podStatus.set(pod.address, 'connected');
     try { await pod.flash(0, 200, 0, { count: 1, onMs: 250 }); } catch {}
     refreshPodList();
@@ -189,16 +181,12 @@ $('#btn-connect-all').onclick = async () => {
   btn.disabled = true;
   try {
     const failed = await manager.connectAll({
-      onPodEvent: (pod, state) => {
-        podStatus.set(pod.address, state);
-        refreshPodList();
-        if (state === 'waiting') toast(`${pod.name}: TAP IT to wake (up to 30s)`, 'warn');
-      },
+      onPodEvent: (pod, state) => { podStatus.set(pod.address, state); refreshPodList(); },
     });
     if (failed.length === 0) {
       toast(`All ${manager.connectedCount} connected`);
     } else {
-      toast(`${manager.connectedCount} connected, ${failed.length} failed — tap and retry`, 'warn');
+      toast(`${manager.connectedCount} connected, ${failed.length} failed`, 'warn');
     }
   } finally {
     refreshPodList();

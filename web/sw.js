@@ -1,6 +1,6 @@
 // Network-first for HTML/JS (so updates ship immediately), cache fallback for offline use.
 // Bumping CACHE name invalidates every previously-cached file.
-const CACHE = 'blazepod-v3';
+const CACHE = 'blazepod-v5';
 const ASSETS = [
   './',
   './index.html',

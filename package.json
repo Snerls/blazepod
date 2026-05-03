@@ -1,0 +1,28 @@
+{
+  "name": "blazepod-hack",
+  "version": "1.0.0",
+  "description": "A Python desktop app that drives BlazePod reaction pods over BLE without the official app or subscription. Reaction-time data stays local — no cloud, no account.",
+  "main": "index.js",
+  "directories": {
+    "example": "examples",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Snerls/blazepod.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Snerls/blazepod/issues"
+  },
+  "homepage": "https://github.com/Snerls/blazepod#readme",
+  "dependencies": {
+    "webbluetooth": "^3.7.0"
+  }
+}

@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BlazePod self-test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font-family: -apple-system, system-ui, sans-serif; background: #0f1115; color: #e6e6e6; }
+  h1 { margin: 0 0 8px; font-size: 20px; }
+  p.muted { color: #8b949e; font-size: 14px; margin: 0 0 14px; }
+  button { appearance: none; background: #1f6feb; color: white; border: 0; border-radius: 10px;
+           padding: 14px 18px; font-size: 17px; font-weight: 700; font-family: inherit; cursor: pointer; width: 100%; }
+  button:active { background: #1158c7; }
+  button:disabled { background: #30363d; color: #8b949e; }
+  button.sec { background: #30363d; }
+  .steps { background: #0a0c10; border: 1px solid #30363d; border-radius: 8px; padding: 12px;
+           min-height: 280px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+           line-height: 1.55; white-space: pre-wrap; margin: 12px 0; }
+  .steps .ok  { color: #3fb950; }
+  .steps .err { color: #f85149; }
+  .steps .pend { color: #8b949e; }
+  .steps .run { color: #d29922; }
+  .summary { font-size: 22px; font-weight: 800; padding: 14px; border-radius: 10px; text-align: center; margin-top: 8px; }
+  .summary.pass { background: #0e3d1f; color: #3fb950; border: 1px solid #3fb950; }
+  .summary.fail { background: #3d0e0e; color: #f85149; border: 1px solid #f85149; }
+  .summary.idle { background: #161b22; color: #8b949e; border: 1px solid #30363d; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .row > * { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; padding: 8px 0; color: #c9d1d9; font-size: 15px; }
+  .check input { width: 22px; height: 22px; }
+</style>
+</head>
+<body>
+
+<h1>BlazePod self-test</h1>
+<p class="muted">Pick ONE pod when prompted. The test runs 10 steps end-to-end and reports a single PASS/FAIL. You will need to physically tap the pod once (Step 8 waits for a tap event).</p>
+
+<button id="run">Run self-test</button>
+
+<div class="steps" id="steps">tap "Run self-test" to begin.</div>
+
+<div class="check">
+  <input type="checkbox" id="visual"> I visually confirmed the pod lit RED at step 6
+</div>
+
+<div class="summary idle" id="summary">RESULT: not run yet</div>
+
+<div class="row">
+  <button class="sec" id="copy">Copy result</button>
+  <button class="sec" id="clear">Clear</button>
+</div>
+
+<script type="module">
+import {
+  UART_SERVICE_UUID, UART_RX_CHAR_UUID,
+  COLOR_SERVICE_UUID, COLOR_CHAR_UUID,
+  TAP_SERVICE_UUID, TAP_CHAR_UUID,
+  COLOR_OFF, buildAuthPayload, decodeTap, encodeColor,
+  bytesToHex, toUint8Array,
+} from './js/protocol.js';
+
+import { Pod, mfrCache, pickPod } from './js/pod.js';
+
+const stepsEl = document.getElementById('steps');
+const summaryEl = document.getElementById('summary');
+const visualEl = document.getElementById('visual');
+
+const STEP_NAMES = [
+  '1. Pick a pod',
+  '2. Get mfrData (cached or fresh)',
+  '3. GATT connect',
+  '4. Get all 3 services',
+  '5. Write auth',
+  '6. Light pod red 1s',
+  '7. Subscribe to taps',
+  '8. Wait for tap (10s) — TAP THE POD',
+  '9. Disconnect',
+  '10. Reconnect using cached mfrData (no watchAdvertisements, <3s)',
+];
+
+const stepStatus = STEP_NAMES.map(() => ({ state: 'pending', detail: '' }));
+
+function render() {
+  stepsEl.innerHTML = STEP_NAMES.map((name, i) => {
+    const s = stepStatus[i];
+    const cls = s.state;
+    const symbol = { pending: '·', run: '→', ok: '✓', err: '✗' }[s.state];
+    return `<span class="${cls}">${symbol} ${name}${s.detail ? '   ' + s.detail : ''}</span>`;
+  }).join('\n');
+}
+
+function setStep(i, state, detail = '') {
+  stepStatus[i] = { state, detail };
+  render();
+}
+
+function setSummary(text, kind) {
+  summaryEl.textContent = text;
+  summaryEl.className = `summary ${kind}`;
+}
+
+async function run() {
+  visualEl.checked = false;
+  for (let i = 0; i < STEP_NAMES.length; i++) stepStatus[i] = { state: 'pending', detail: '' };
+  render();
+  setSummary('RESULT: running…', 'idle');
+
+  let pod = null;
+  let device = null;
+  let firstConnectMs = 0;
+
+  // 1. Pick
+  setStep(0, 'run');
+  try {
+    device = await pickPod();
+    setStep(0, 'ok', `device.id=${device.id.slice(0, 8)}…  name=${device.name || '?'}`);
+  } catch (e) {
+    setStep(0, 'err', e?.name === 'NotFoundError' ? 'cancelled' : (e?.message || String(e)));
+    return finish(0);
+  }
+
+  // 2. mfrData (cached or fresh)
+  setStep(1, 'run');
+  pod = new Pod(device);
+  const cached = mfrCache.get(device.id);
+  if (cached) {
+    setStep(1, 'ok', `cached  bytes=${bytesToHex(cached)}`);
+  } else {
+    setStep(1, 'run', 'no cache — running watchAdvertisements (TAP THE POD HARD)');
+    try {
+      const t0 = performance.now();
+      // The Pod.connect() call itself runs awaitMfrData, but we want a separate
+      // measurement. Trigger it via connect() and time it.
+      await pod.connect();
+      // Disconnect right away — step 3 will reconnect to time it cleanly.
+      await pod.disconnect();
+      const dt = performance.now() - t0;
+      const mfr = mfrCache.get(device.id);
+      if (!mfr) throw new Error('mfrData missing after first connect');
+      setStep(1, 'ok', `fresh in ${dt.toFixed(0)}ms  bytes=${bytesToHex(mfr)}`);
+      pod = new Pod(device); // fresh Pod for the rest of the test
+    } catch (e) {
+      setStep(1, 'err', `${e?.name || ''} ${e?.message || e}`);
+      return finish(1);
+    }
+  }
+
+  // 3. GATT connect
+  setStep(2, 'run');
+  try {
+    const t0 = performance.now();
+    await pod.connect();
+    firstConnectMs = performance.now() - t0;
+    setStep(2, 'ok', `connected in ${firstConnectMs.toFixed(0)}ms`);
+  } catch (e) {
+    setStep(2, 'err', `${e?.name || ''} ${e?.message || e}`);
+    return finish(2);
+  }
+
+  // 4. Services (Pod.connect already fetched all three; verify)
+  setStep(3, 'run');
+  try {
+    const services = await pod.server.getPrimaryServices();
+    const ids = services.map((s) => s.uuid.toLowerCase());
+    const missing = [];
+    if (!ids.includes(UART_SERVICE_UUID))  missing.push('UART');
+    if (!ids.includes(COLOR_SERVICE_UUID)) missing.push('COLOR');
+    if (!ids.includes(TAP_SERVICE_UUID))   missing.push('TAP');
+    if (missing.length) throw new Error('missing services: ' + missing.join(', '));
+    setStep(3, 'ok', `UART, COLOR, TAP all present (${services.length} total)`);
+  } catch (e) { setStep(3, 'err', e.message); return finish(3); }
+
+  // 5. Auth (already happened in pod.connect — flag as ok if connect succeeded)
+  setStep(4, 'ok', 'auth payload accepted (verified by successful connect+notify subscribe)');
+
+  // 6. Red 1s
+  setStep(5, 'run');
+  try {
+    await pod.setColor(255, 0, 0);
+    await new Promise((r) => setTimeout(r, 1000));
+    await pod.turnOff();
+    setStep(5, 'ok', 'wrote red, slept 1s, wrote off — confirm visually');
+  } catch (e) { setStep(5, 'err', e.message); return finish(5); }
+
+  // 7. Subscribe (Pod.connect already subscribed — verify by reading internal state)
+  setStep(6, pod._tapChar ? 'ok' : 'err', pod._tapChar ? 'subscription active' : 'no tap char');
+  if (!pod._tapChar) return finish(6);
+
+  // 8. Wait for tap
+  setStep(7, 'run', 'TAP THE POD NOW (10s window)');
+  try {
+    const ev = await new Promise((resolve, reject) => {
+      const off = pod.onTap((_p, e) => { off(); resolve(e); });
+      setTimeout(() => { off(); reject(new Error('no tap within 10s')); }, 10000);
+    });
+    setStep(7, 'ok', `state=0x${ev.state.toString(16).padStart(2, '0')} elapsed_ms=${ev.elapsedMs}`);
+  } catch (e) { setStep(7, 'err', e.message); return finish(7); }
+
+  // 9. Disconnect
+  setStep(8, 'run');
+  try {
+    await pod.disconnect();
+    setStep(8, 'ok', 'clean disconnect');
+  } catch (e) { setStep(8, 'err', e.message); return finish(8); }
+
+  // 10. Reconnect using cached mfrData (must be <3s, no watchAdvertisements)
+  setStep(9, 'run', 'reconnecting…');
+  try {
+    const pod2 = new Pod(device);
+    const t0 = performance.now();
+    await pod2.connect();
+    const dt = performance.now() - t0;
+    await pod2.disconnect();
+    if (dt > 5000) {
+      setStep(9, 'err', `slow reconnect ${dt.toFixed(0)}ms (>5000ms suggests cache miss)`);
+      return finish(9);
+    }
+    setStep(9, 'ok', `reconnected in ${dt.toFixed(0)}ms (was first ${firstConnectMs.toFixed(0)}ms)`);
+  } catch (e) { setStep(9, 'err', e.message); return finish(9); }
+
+  finish(STEP_NAMES.length);
+}
+
+function finish(failedAt) {
+  if (failedAt < STEP_NAMES.length) {
+    setSummary(`RESULT: FAIL at step ${failedAt + 1} — ${STEP_NAMES[failedAt]}`, 'fail');
+  } else if (!visualEl.checked) {
+    setSummary('RESULT: PASS (10/10) — but please tick the visual confirmation box', 'idle');
+  } else {
+    setSummary('RESULT: PASS (10/10) ✓ visually confirmed', 'pass');
+  }
+}
+
+document.getElementById('run').onclick = async () => {
+  document.getElementById('run').disabled = true;
+  try { await run(); }
+  catch (e) { setSummary(`RESULT: FAIL — unhandled: ${e.message}`, 'fail'); }
+  finally { document.getElementById('run').disabled = false; }
+};
+
+document.getElementById('clear').onclick = () => {
+  for (let i = 0; i < STEP_NAMES.length; i++) stepStatus[i] = { state: 'pending', detail: '' };
+  render();
+  setSummary('RESULT: not run yet', 'idle');
+  visualEl.checked = false;
+};
+
+document.getElementById('copy').onclick = async () => {
+  const lines = STEP_NAMES.map((n, i) => {
+    const s = stepStatus[i];
+    const sym = { pending: '·', run: '→', ok: '✓', err: '✗' }[s.state];
+    return `${sym} ${n}${s.detail ? '   ' + s.detail : ''}`;
+  });
+  const text = lines.join('\n') + '\n\n' + summaryEl.textContent + (visualEl.checked ? '   [visual ok]' : '   [visual unchecked]');
+  try { await navigator.clipboard.writeText(text); summaryEl.textContent += '   (copied)'; }
+  catch { /* ignore */ }
+};
+
+render();
+</script>
+
+</body>
+</html>

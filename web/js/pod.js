@@ -1,20 +1,29 @@
-// One BlazePod connection — port of src/blazepod/pod.py.
-// Web Bluetooth: device chosen via requestDevice(); we then use watchAdvertisements()
-// to grab the manufacturer-specific data needed for the auth handshake.
+// One BlazePod connection — port of src/blazepod/pod.py, adapted for Web Bluetooth.
+//
+// IMPORTANT discovery (verified live by tests/auth_probe.py against real pods):
+// the BlazePod auth check on the pod side does NOT actually validate the
+// secret — ANY 7-byte write to UART RX satisfies it (even 'sea' + zeros, or
+// even a wrong prefix). So we don't need to read manufacturerData at all,
+// which is the one thing iOS Web Bluetooth does not let us do. Skipping
+// watchAdvertisements unblocks the iPhone/Bluefy path entirely.
 
 import {
-  AUTH_PREFIX, COLOR_CHAR_UUID, COLOR_OFF, COLOR_SERVICE_UUID,
+  COLOR_CHAR_UUID, COLOR_OFF, COLOR_SERVICE_UUID,
   TAP_CHAR_UUID, TAP_SERVICE_UUID, UART_RX_CHAR_UUID, UART_SERVICE_UUID,
-  buildAuthPayload, bytesToHex, decodeTap, encodeColor, hexToBytes, toUint8Array,
+  bytesToHex, decodeTap, encodeColor, hexToBytes, toUint8Array,
 } from './protocol.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Persistent cache of per-pod manufacturer data (the input to the auth handshake).
-// mfrData is derived from the pod's hardware identity and never changes, so we can
-// skip the slow watchAdvertisements + tap-to-wake dance on every reconnect.
-const MFR_CACHE_KEY = 'blazepod.mfr.v1';
+// Static 7-byte handshake. The pod accepts any 7 bytes; "sea" + zeros is just
+// a clean canonical choice that mirrors the documented protocol prefix.
+const STATIC_AUTH_PAYLOAD = new Uint8Array([0x73, 0x65, 0x61, 0, 0, 0, 0]);
 
+// Kept exported for backward-compat with the debug page; no longer used in
+// the connect path. The cache used to store per-device mfrData; with the
+// static payload it's dead code, but we leave the API intact so the UI
+// "Forget cache" button keeps working as a no-op.
+const MFR_CACHE_KEY = 'blazepod.mfr.v1';
 export const mfrCache = {
   _read() {
     try { return JSON.parse(localStorage.getItem(MFR_CACHE_KEY) || '{}') || {}; }
@@ -39,58 +48,7 @@ export const mfrCache = {
   clear() { this._write({}); },
 };
 
-function pickMfrDataFromAdvertisement(event) {
-  // event.manufacturerData is a Map<number, DataView>
-  if (!event.manufacturerData || event.manufacturerData.size === 0) return null;
-  let best = null;
-  event.manufacturerData.forEach((dv) => {
-    const bytes = toUint8Array(dv);
-    if (bytes.length >= 5 && (best === null || bytes.length > best.length)) {
-      best = bytes;
-    }
-  });
-  return best;
-}
-
-// Wait for one advertisement that carries usable manufacturer data.
-// On iOS, pods sleep aggressively — caller should prompt the user to tap
-// the pod after picker selection so it broadcasts a fresh advertisement.
-async function awaitMfrData(device, { timeoutMs = 10000, onWaiting } = {}) {
-  if (!device.watchAdvertisements) {
-    throw new Error("Browser doesn't support watchAdvertisements (use Bluefy on iOS).");
-  }
-  const cached = device._cachedMfr;
-  if (cached) return cached;
-
-  return new Promise(async (resolve, reject) => {
-    let done = false;
-    const onAd = (ev) => {
-      const mfr = pickMfrDataFromAdvertisement(ev);
-      if (mfr && !done) {
-        done = true;
-        device.removeEventListener('advertisementreceived', onAd);
-        device._cachedMfr = mfr;
-        resolve(mfr);
-      }
-    };
-    device.addEventListener('advertisementreceived', onAd);
-    try {
-      await device.watchAdvertisements();
-    } catch (e) {
-      device.removeEventListener('advertisementreceived', onAd);
-      return reject(e);
-    }
-    if (onWaiting) {
-      try { onWaiting(); } catch {}
-    }
-    setTimeout(() => {
-      if (!done) {
-        device.removeEventListener('advertisementreceived', onAd);
-        reject(new Error(`pod didn't broadcast within ${Math.round(timeoutMs / 1000)}s — tap the pod hard, then try again`));
-      }
-    }, timeoutMs);
-  });
-}
+// (No watchAdvertisements helper — auth is static, see STATIC_AUTH_PAYLOAD above.)
 
 export class Pod {
   constructor(device) {
@@ -104,11 +62,6 @@ export class Pod {
     this._connected = false;
     this._notifyHandler = (event) => this._onNotify(event);
     device.addEventListener('gattserverdisconnected', () => { this._connected = false; });
-
-    // Pre-seed the per-device cache from persistent storage so awaitMfrData
-    // resolves instantly on every reconnect after the first.
-    const cached = mfrCache.get(device.id);
-    if (cached) device._cachedMfr = cached;
   }
 
   get isConnected() { return this._connected && this.server?.connected === true; }
@@ -116,12 +69,12 @@ export class Pod {
   onTap(cb) { this._listeners.add(cb); return () => this._listeners.delete(cb); }
   clearTapListeners() { this._listeners.clear(); }
 
-  async connect({ retries = 2, onWaiting } = {}) {
+  async connect({ retries = 2 } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         if (attempt > 0) await sleep(500);
-        await this._connectOnce({ onWaiting });
+        await this._connectOnce();
         return;
       } catch (e) {
         lastErr = e;
@@ -131,22 +84,16 @@ export class Pod {
     throw lastErr;
   }
 
-  async _connectOnce({ onWaiting } = {}) {
-    this.mfrData = await awaitMfrData(this.device, { onWaiting });
+  async _connectOnce(_opts = {}) {
     this.server = await this.device.gatt.connect();
 
     const uart   = await this.server.getPrimaryService(UART_SERVICE_UUID);
     const rxChar = await uart.getCharacteristic(UART_RX_CHAR_UUID);
-    try {
-      await rxChar.writeValueWithResponse(buildAuthPayload(this.mfrData));
-    } catch (e) {
-      // Auth write failed — most likely cause is a stale cached mfrData.
-      // Drop the cached value, drop the in-memory shortcut, and disconnect so
-      // the outer retry loop picks up a fresh advertisement next attempt.
-      mfrCache.forget(this.device.id);
-      delete this.device._cachedMfr;
-      try { this.device.gatt.disconnect(); } catch {}
-      throw e;
+    // The pod accepts any 7-byte UART RX write; STATIC_AUTH_PAYLOAD is "sea\0\0\0\0".
+    if (rxChar.writeValueWithResponse) {
+      await rxChar.writeValueWithResponse(STATIC_AUTH_PAYLOAD);
+    } else {
+      await rxChar.writeValue(STATIC_AUTH_PAYLOAD);
     }
 
     const tap = await this.server.getPrimaryService(TAP_SERVICE_UUID);
@@ -157,9 +104,6 @@ export class Pod {
     // Pre-fetch the color characteristic so writes are fast in drills
     const colorService = await this.server.getPrimaryService(COLOR_SERVICE_UUID);
     this._colorChar = await colorService.getCharacteristic(COLOR_CHAR_UUID);
-
-    // Auth succeeded — persist mfrData so future sessions skip watchAdvertisements.
-    mfrCache.set(this.device.id, this.mfrData);
 
     this._connected = true;
   }
